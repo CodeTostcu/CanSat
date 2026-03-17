@@ -1,0 +1,194 @@
+#include <Wire.h>
+#include <SPI.h>
+#include <RH_RF69.h>
+
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BMP3XX.h>
+#include <Adafruit_MPU6050.h>
+#include <TinyGPS++.h>
+
+/************ RADIO SETUP *************/
+#define RFM69_CS   1
+#define RFM69_INT  24
+#define RFM69_RST  25
+#define RFM69_FREQ 915.0
+#define ENCRYPTKEY "1234567890123456"
+#define LED        13
+
+RH_RF69 rf69(RFM69_CS, RFM69_INT);
+
+/************ SENSORER *************/
+#define SEALEVELPRESSURE_HPA 1013.25
+
+Adafruit_BMP3XX bmp;
+Adafruit_MPU6050 mpu;
+TinyGPSPlus gps;
+
+sensors_event_t a, g, temp;
+
+/************ TIDSINTERVALL *************/
+const unsigned long BMP_INTERVAL   = 1000;
+const unsigned long MPU_INTERVAL   = 500;
+const unsigned long RADIO_INTERVAL = 1000;
+
+unsigned long lastBMP   = 0;
+unsigned long lastMPU   = 0;
+unsigned long lastRadio = 0;
+
+float bmpPressure = 0;
+float bmpAltitude = 0;
+
+double lastLat = 0;
+double lastLon = 0;
+
+const int MAX_PACKET = 60;
+
+const uint8_t set5Hz[] = {
+  0xB5,0x62,0x06,0x08,0x06,0x00,
+  0xC8,0x00,0x01,0x00,0x01,0x00,
+  0xDE,0x6A
+};
+
+/************ FUNKTIONER *************/
+void feedGPS() {
+  while (Serial1.available()) {
+    gps.encode(Serial1.read());
+  }
+}
+
+bool gpsOK() {
+  return gps.location.isValid() &&
+         gps.location.age() < 2000 &&
+         gps.satellites.value() >= 5 &&
+         gps.hdop.isValid() &&
+         gps.hdop.hdop() < 2.5;
+}
+
+/************ SETUP *************/
+void setup() {
+  Serial.begin(115200);
+ 
+
+  pinMode(LED, OUTPUT);
+  pinMode(RFM69_RST, OUTPUT);
+
+  /* ----- GPS ----- */
+  Serial1.begin(9600);
+  delay(200);
+  Serial1.write(set5Hz, sizeof(set5Hz));
+
+  /* ----- I2C ----- */
+  Wire.begin();
+
+  /* ----- BMP390 ----- */
+  if (!bmp.begin_I2C()) {
+    Serial.println("BMP390 hittades inte");
+    while (1);
+  }
+  bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_4X);
+  bmp.setPressureOversampling(BMP3_OVERSAMPLING_4X);
+  bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
+
+  /* ----- MPU6050 ----- */
+  if (!mpu.begin()) {
+    Serial.println("MPU6050 hittades inte");
+    while (1);
+  }
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_5_HZ);
+
+  /* ----- RFM69 ----- */
+  digitalWrite(RFM69_RST, HIGH);
+  delay(10);
+  digitalWrite(RFM69_RST, LOW);
+  delay(10);
+
+  if (!rf69.init()) {
+    Serial.println("RFM69 init failed");
+    while (1);
+  }
+  rf69.setFrequency(RFM69_FREQ);
+  rf69.setTxPower(20, true);
+  rf69.setEncryptionKey((uint8_t*)ENCRYPTKEY);
+
+  Serial.println("Alla system startade ");
+}
+
+/************ LOOP *************/
+void loop() {
+  feedGPS();
+  unsigned long now = millis();
+
+  /* ----- BMP390 ----- */
+  if (now - lastBMP >= BMP_INTERVAL) {
+    lastBMP = now;
+    if (bmp.performReading()) {
+      bmpPressure = bmp.pressure / 100.0;
+      bmpAltitude = bmp.readAltitude(SEALEVELPRESSURE_HPA);
+    }
+  }
+
+  /* ----- MPU6050 ----- */
+  if (now - lastMPU >= MPU_INTERVAL) {
+    lastMPU = now;
+    mpu.getEvent(&a, &g, &temp);
+  }
+
+  /* ----- RADIO ----- */
+  if (now - lastRadio >= RADIO_INTERVAL) {
+    lastRadio = now;
+
+    if (gpsOK()) {
+      lastLat = gps.location.lat();
+      lastLon = gps.location.lng();
+    }
+
+    char payload[200];
+
+    if (gpsOK()) {
+      snprintf(payload, sizeof(payload),
+        "LAT:%.6f,LON:%.6f,SAT:%d,HDOP:%.2f,AGE:%lu,"
+        "P:%.1f,ALT:%.1f,"
+        "AX:%.2f,AY:%.2f,AZ:%.2f,"
+        "GX:%.2f,GY:%.2f,GZ:%.2f,T:%.1f",
+        gps.location.lat(),
+        gps.location.lng(),
+        gps.satellites.value(),
+        gps.hdop.hdop(),
+        gps.location.age(),
+        bmpPressure,
+        bmpAltitude,
+        a.acceleration.x, a.acceleration.y, a.acceleration.z,
+        g.gyro.x, g.gyro.y, g.gyro.z,
+        temp.temperature
+      );
+    } else {
+      snprintf(payload, sizeof(payload),
+        "GPS:NOFIX,LAT:%.6f,LON:%.6f,"
+        "P:%.1f,ALT:%.1f,"
+        "AX:%.2f,AY:%.2f,AZ:%.2f,"
+        "GX:%.2f,GY:%.2f,GZ:%.2f,T:%.1f",
+        lastLat, lastLon,
+        bmpPressure,
+        bmpAltitude,
+        a.acceleration.x, a.acceleration.y, a.acceleration.z,
+        g.gyro.x, g.gyro.y, g.gyro.z,
+        temp.temperature
+      );
+    }
+
+    int len = strlen(payload);
+    for (int i = 0; i < len; i += MAX_PACKET) {
+      int chunkSize = min(MAX_PACKET, len - i);
+      rf69.send((uint8_t*)(payload + i), chunkSize);
+      rf69.waitPacketSent();
+      feedGPS();
+    }
+
+    digitalWrite(LED, HIGH);
+    unsigned long t0 = millis();
+    while (millis() - t0 < 20) feedGPS();
+    digitalWrite(LED, LOW);
+  }
+}
