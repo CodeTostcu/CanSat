@@ -1,0 +1,68 @@
+#include <SPI.h>
+#include <RH_RF69.h>
+
+/************ RADIO SETUP *************/
+#define RFM69_CS    1
+#define RFM69_INT   24
+#define RFM69_RST   25
+#define RFM69_FREQ  915.0
+#define ENCRYPTKEY  "1234567890123456"
+#define LED         13
+
+RH_RF69 rf69(RFM69_CS, RFM69_INT);
+
+/************ PACKET *************/
+#define MAX_PACKET 60
+
+void setup() {
+  pinMode(LED, OUTPUT);
+  pinMode(RFM69_RST, OUTPUT);
+
+  Serial.begin(115200);
+  while (!Serial);
+
+  Serial.println("RFM69 RX Telemetry Receiver");
+
+  /* ----- RFM69 RESET ----- */
+  digitalWrite(RFM69_RST, HIGH);
+  delay(10);
+  digitalWrite(RFM69_RST, LOW);
+  delay(10);
+
+  if (!rf69.init()) {
+    Serial.println("RFM69 init failed");
+    while (1);
+  }
+
+  if (!rf69.setFrequency(RFM69_FREQ)) {
+    Serial.println("setFrequency failed");
+    while (1);
+  }
+
+  rf69.setTxPower(20, true);
+  rf69.setEncryptionKey((uint8_t*)ENCRYPTKEY);
+
+  Serial.println("RFM69 ready and listening...");
+}
+
+void loop() {
+  if (rf69.available()) {
+    uint8_t buf[RH_RF69_MAX_MESSAGE_LEN];
+    uint8_t len = sizeof(buf);
+
+    if (rf69.recv(buf, &len)) {
+      digitalWrite(LED, HIGH);
+
+      // Ensure null-terminated string
+      buf[len] = '\0';
+
+      Serial.print("RX: ");
+      Serial.println((char*)buf);
+
+      Serial.print("RSSI: ");
+      Serial.println(rf69.lastRssi());
+
+      digitalWrite(LED, LOW);
+    }
+  }
+}
